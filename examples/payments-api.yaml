@@ -1,0 +1,171 @@
+name: SEPA Payment Initiation API
+version: "2.1"
+owner: Payments Platform
+description: >-
+  Corporate customers submit SEPA credit transfers through a public API. A
+  vendor reconciliation service collects settlement files over SFTP. The model
+  covers initiation through settlement, not the core banking ledger behind it.
+
+boundaries:
+  - id: internet
+    name: Public internet
+    description: Untrusted. No control over anything on this side.
+  - id: dmz
+    name: DMZ
+    description: Terminates public traffic. Holds no persistent customer data.
+  - id: core
+    name: Core banking zone
+    description: Segmented network, jump-host access only, change-controlled.
+  - id: vendor
+    name: Third-party vendor
+    description: >-
+      Reconciliation provider. Contractually bound, operationally opaque - we
+      cannot audit their controls, only their outputs.
+
+elements:
+  - id: corporate_client
+    kind: external
+    name: Corporate treasury client
+    boundary: internet
+    description: Customer ERP systems submitting payment instructions.
+
+  - id: reconciliation_vendor
+    kind: external
+    name: Reconciliation vendor
+    boundary: vendor
+    description: Receives settlement files and returns matched positions.
+
+  - id: api_gateway
+    kind: process
+    name: API gateway
+    boundary: dmz
+    technologies: [nginx, oauth2-proxy]
+    data: [internal]
+    controls: [tls, oauth2, rate_limit]
+
+  - id: payment_service
+    kind: process
+    name: Payment initiation service
+    boundary: core
+    technologies: [python, flask]
+    data: [pii, confidential]
+    controls: [input_validation, rbac, audit_log]
+    description: Validates instructions, applies limits, enqueues for settlement.
+
+  - id: settlement_worker
+    kind: process
+    name: Settlement worker
+    boundary: core
+    technologies: [python, celery]
+    data: [confidential]
+    controls: [audit_log]
+
+  - id: payments_db
+    kind: store
+    name: Payments database
+    boundary: core
+    technologies: [postgresql]
+    data: [pii, confidential]
+    controls: [encryption_at_rest, backup_restore]
+
+  - id: sftp_drop
+    kind: store
+    name: Settlement file drop
+    boundary: dmz
+    technologies: [sftp]
+    data: [confidential]
+    # No encryption at rest and no integrity control: this is the finding the
+    # model exists to surface, kept here deliberately rather than fixed.
+
+  - id: hsm
+    kind: store
+    name: Signing HSM
+    boundary: core
+    technologies: [pkcs11]
+    data: [secret]
+    controls: [secrets_manager, key_rotation, least_privilege, network_segmentation]
+
+flows:
+  - id: f_submit
+    name: Submit payment instruction
+    source: corporate_client
+    target: api_gateway
+    protocol: HTTPS
+    data: [pii, confidential]
+    authenticated: true
+    encrypted: true
+    controls: [tls, oauth2, rate_limit]
+    description: >-
+      POST /v1/payments to submit, GET /v1/payments/{id} to poll status.
+
+  - id: f_gateway_to_service
+    name: Forward validated request
+    source: api_gateway
+    target: payment_service
+    protocol: HTTP
+    data: [pii, confidential]
+    authenticated: true
+    encrypted: false
+    description: >-
+      Cleartext inside the core zone. Accepted historically on the argument that
+      the segment is trusted; the model disagrees and says why.
+    accepted:
+      F-TAMP-01: >-
+        Segment is physically isolated and monitored; re-encryption is scheduled
+        for the Q4 platform upgrade (ticket PLAT-2291).
+
+  - id: f_service_db
+    name: Persist instruction
+    source: payment_service
+    target: payments_db
+    protocol: TLS/5432
+    data: [pii, confidential]
+    authenticated: true
+    encrypted: true
+    controls: [tls, rbac]
+
+  - id: f_service_sign
+    name: Sign settlement batch
+    source: settlement_worker
+    target: hsm
+    protocol: PKCS#11
+    data: [secret]
+    authenticated: true
+    encrypted: true
+    controls: [mtls, least_privilege]
+
+  - id: f_worker_drop
+    name: Write settlement file
+    source: settlement_worker
+    target: sftp_drop
+    protocol: SFTP
+    data: [confidential]
+    authenticated: true
+    encrypted: true
+    controls: [tls]
+
+  - id: f_vendor_pull
+    name: Vendor collects settlement file
+    source: sftp_drop
+    target: reconciliation_vendor
+    protocol: SFTP
+    data: [confidential, pii]
+    authenticated: false
+    encrypted: true
+    description: >-
+      Shared-key SFTP account, no per-request authentication and no signature on
+      the file itself. The vendor cannot prove what they received and we cannot
+      prove what we sent.
+
+  - id: f_vendor_return
+    name: Vendor returns matched positions
+    source: reconciliation_vendor
+    target: payment_service
+    protocol: HTTPS
+    data: [confidential]
+    authenticated: false
+    encrypted: true
+    description: >-
+      POST /internal/reconciliation/callback. Inbound from a lower-trust zone
+      straight into the service that moves money, with no authentication on the
+      caller.
