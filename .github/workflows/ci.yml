@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: ruff check src tests
+      - run: pytest -q
+
+  model:
+    # What this project is for: the model is checked on every pull request,
+    # so it cannot drift away from the code without someone being told.
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e .
+
+      - name: The model is well formed
+        run: tmac validate examples/payments-api.yaml
+
+      - name: Threats enumerate and rank
+        run: tmac analyse examples/payments-api.yaml --markdown threat-report.md
+
+      - name: The backlog generates
+        run: tmac stories examples/payments-api.yaml --out security-backlog.md
+
+      - name: The model matches the code
+        # Expected to FAIL here: examples/app deliberately exposes an endpoint
+        # the model does not declare, so this step proves the check works.
+        # Point it at your own source tree and drop the negation.
+        run: |
+          if tmac drift examples/payments-api.yaml examples/app --strict; then
+            echo "::error::the drift check did not catch the deliberately undeclared endpoint"
+            exit 1
+          fi
+          echo "drift detected as expected"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: threat-model
+          path: |
+            threat-report.md
+            security-backlog.md
