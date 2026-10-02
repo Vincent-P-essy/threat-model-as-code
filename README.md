@@ -19,6 +19,12 @@ source tree so the model cannot quietly rot.
 
 ![tmac analyse](docs/assets/analyse.png)
 
+## Execution preview
+
+![threat-model-as-code execution](docs/screenshots/execution.png)
+
+Local execution of `tmac analyse examples/payments-api.yaml`. The input and output shown come from the repository example or test fixtures. [Verification](docs/verification.md).
+
 ## Why the output is short
 
 Most threat-model generators emit all six STRIDE categories for every element.
